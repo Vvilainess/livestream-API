@@ -1,0 +1,18 @@
+services:
+  # Dịch vụ Backend
+  backend:
+    build: ./backend
+    ports:
+      - "5000:5000"
+    volumes:
+      # Gắn thư mục video của bạn vào container
+      - D:/Live/videos:/videos
+    restart: always # Bỏ comment nếu muốn tự khởi động lại khi bị lỗi
+
+  # Dịch vụ Frontend
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend # Đảm bảo backend khởi động trước frontend
