@@ -1,0 +1,6 @@
+Flask
+Flask-SocketIO
+Flask-Cors
+psutil
+gevent-websocket
+waitress
