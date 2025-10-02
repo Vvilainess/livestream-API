@@ -6,7 +6,7 @@ import sys
 import logging
 import time
 import threading
-from flask import Flask, jsonify, request
+from flask import Flask
 from flask_cors import CORS
 from flask_socketio import SocketIO
 import psutil
@@ -14,11 +14,7 @@ import psutil
 # ==============================================================================
 # CẤU HÌNH LOGGING VÀ MÔI TRƯỜNG
 # ==============================================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    stream=sys.stdout
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
 VIDEO_DIRECTORY = os.getenv('VIDEO_DIRECTORY', '/videos')
 logging.info(f"Thư mục video được cấu hình: {VIDEO_DIRECTORY}")
 
@@ -27,7 +23,6 @@ logging.info(f"Thư mục video được cấu hình: {VIDEO_DIRECTORY}")
 # ==============================================================================
 app = Flask(__name__)
 CORS(app)
-# Sử dụng gevent để có hiệu suất tốt nhất cho các tác vụ bất đồng bộ
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
 # ==============================================================================
@@ -35,47 +30,44 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 # ==============================================================================
 schedules = []
 running_streams = {}
-# Rất quan trọng: Sử dụng Lock để tránh race condition khi nhiều luồng
-# cùng truy cập vào các biến schedules và running_streams
+retry_start_times = {} 
 state_lock = threading.Lock()
 background_thread = None
+RETRY_WINDOW_SECONDS = 180  # 3 phút
 
 # ==============================================================================
-# FFMPEG COMMANDS
+# FFMPEG COMMANDS (ĐÃ TỐI ƯU HÓA)
 # ==============================================================================
+FFMPEG_BASE_OPTIONS = '' 
 FFMPEG_CMD_INFINITE = (
-    'ffmpeg -re -i "{video_file}" -c:v copy -c:a copy '
-    '-f flv -nostdin "{rtmp_url}"'
+    f'ffmpeg -re -stream_loop -1 {FFMPEG_BASE_OPTIONS} '
+    '-i "{video_file}" -c:v copy -c:a copy -f flv '
+    '-nostdin "{rtmp_url}"'
 )
 FFMPEG_CMD_TIMED = (
-    'ffmpeg -re -stream_loop -1 -i "{video_file}" -t {duration} '
-    '-c:v copy -c:a copy -f flv -nostdin "{rtmp_url}"'
+    f'ffmpeg -re {FFMPEG_BASE_OPTIONS} '
+    '-i "{video_file}" -t {duration} '
+    '-c:v copy -c:a copy -f flv '
+    '-nostdin "{rtmp_url}"'
 )
 
 # ==============================================================================
 # CÁC HÀM TIỆN ÍCH (HELPER FUNCTIONS)
 # ==============================================================================
-def _async_terminate_worker(pid):
+def force_kill_process(pid):
     try:
-        logging.info(f"Luồng nền bắt đầu dừng PID {pid}.")
         parent = psutil.Process(pid)
         children = parent.children(recursive=True)
-        for child in children:
-            child.terminate()
-        parent.terminate()
-        gone, alive = psutil.wait_procs(children + [parent], timeout=5)
-        for p in alive:
-            p.kill()
-        logging.info(f"Đã dọn dẹp xong cho PID {pid}.")
+        all_procs = children + [parent]
+        for proc in all_procs:
+            try: proc.terminate()
+            except psutil.NoSuchProcess: pass
+        _, alive = psutil.wait_procs(all_procs, timeout=3)
+        for proc in alive:
+            try: proc.kill()
+            except psutil.NoSuchProcess: pass
     except psutil.NoSuchProcess:
-        pass # Không cần log warning vì tiến trình có thể đã dừng trước đó
-    except Exception:
-        logging.exception(f"Lỗi trong luồng nền khi dừng PID {pid}.")
-
-def terminate_process_async(pid):
-    thread = threading.Thread(target=_async_terminate_worker, args=(pid,))
-    thread.daemon = True
-    thread.start()
+        pass
 
 def get_schedule_status(schedule):
     # (Hàm này giữ nguyên như trước)
@@ -83,7 +75,7 @@ def get_schedule_status(schedule):
     try:
         broadcast_time = datetime.datetime.fromisoformat(broadcast_time_str.replace('Z', '+00:00'))
         current_time = datetime.datetime.now(datetime.timezone.utc)
-        if schedule['status'] in ['FAILED', 'COMPLETED', 'STOPPING']:
+        if schedule['status'] in ['FAILED', 'COMPLETED', 'STOPPING', 'RETRYING']:
             return schedule['status']
         if broadcast_time > current_time:
             return "PENDING"
@@ -100,7 +92,7 @@ def is_process_running(process):
     if not process: return False
     try:
         p = psutil.Process(process.pid)
-        return p.is_running() and p.status() not in [psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD]
+        return p.is_running() and p.status() != psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:
         return False
     return True
@@ -111,83 +103,123 @@ def is_process_running(process):
 def manage_ffmpeg_stream(schedule):
     schedule_id = schedule['id']
     target_status = get_schedule_status(schedule)
-
-    if schedule['status'] != target_status:
+    
+    if schedule['status'] != 'RETRYING' and schedule['status'] != target_status:
         schedule['status'] = target_status
     
     process = running_streams.get(schedule_id)
 
     if is_process_running(process):
+        if schedule_id in retry_start_times:
+            logging.info(f"Luồng ID={schedule_id} đã phục hồi thành công. Hủy chu kỳ retry.")
+            retry_start_times.pop(schedule_id, None)
         if target_status != 'LIVE':
-            logging.info(f"Luồng ID={schedule_id} đã hết giờ hoặc bị dừng. Dừng tiến trình...")
-            terminate_process_async(process.pid)
+            logging.info(f"Luồng ID={schedule_id} đã hết giờ. Dừng process...")
+            force_kill_process(process.pid)
             del running_streams[schedule_id]
-    else:
-        if schedule_id in running_streams:
-             del running_streams[schedule_id]
-             if target_status == 'LIVE' and not schedule.get('durationMinutes'):
-                 logging.info(f"TỰ ĐỘNG KHỞI ĐỘNG LẠI luồng VÔ HẠN ID={schedule_id}.")
-             else:
-                 schedule['status'] = 'COMPLETED'
+        return
 
-    if schedule['status'] == 'LIVE' and schedule_id not in running_streams:
+    if schedule_id in running_streams:
+        del running_streams[schedule_id]
+
+    if target_status != 'LIVE':
+        return
+
+    first_failure_time = retry_start_times.get(schedule_id)
+    if first_failure_time:
+        elapsed_time = time.time() - first_failure_time
+        if elapsed_time > RETRY_WINDOW_SECONDS:
+            schedule['status'] = 'FAILED'
+            logging.error(f"Luồng ID={schedule_id} FAILED. Đã ngừng thử lại sau {RETRY_WINDOW_SECONDS} giây.")
+            retry_start_times.pop(schedule_id, None)
+            return
+        else:
+            schedule['status'] = 'RETRYING'
+            remaining_time = int(RETRY_WINDOW_SECONDS - elapsed_time)
+            logging.warning(f"Thử lại luồng ID={schedule_id}. Còn lại {remaining_time} giây trong chu kỳ retry.")
+    else:
+        # Kiểm tra file chỉ ở lần khởi động ĐẦU TIÊN
         video_filename = schedule['videoIdentifier']
         video_file_path = os.path.join(VIDEO_DIRECTORY, video_filename)
         if not os.path.isfile(video_file_path):
             schedule['status'] = 'FAILED'
-            logging.error(f"LỖI: File video không tồn tại: {video_file_path}")
+            logging.error(f"LỖI: File video không tồn tại: {video_file_path}. Luồng sẽ không bắt đầu.")
             return
 
-        rtmp_url = f"{schedule['rtmpServer']}/{schedule['streamKey']}"
-        duration_minutes = schedule.get('durationMinutes')
-        
-        command = FFMPEG_CMD_TIMED.format(video_file=video_file_path, rtmp_url=rtmp_url, duration=duration_minutes * 60) if duration_minutes else FFMPEG_CMD_INFINITE.format(video_file=video_file_path, rtmp_url=rtmp_url)
-        logging.info(f"KHỞI ĐỘNG luồng ID={schedule_id}.")
-        
-        try:
-            new_process = subprocess.Popen(command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            running_streams[schedule_id] = new_process
-        except Exception:
-            logging.exception(f"LỖI NGHIÊM TRỌNG khi chạy ffmpeg cho ID={schedule_id}.")
-            schedule['status'] = 'FAILED'
+        logging.warning(f"Luồng ID={schedule_id} gặp sự cố. Bắt đầu chu kỳ thử lại trong {RETRY_WINDOW_SECONDS} giây.")
+        retry_start_times[schedule_id] = time.time()
+        schedule['status'] = 'RETRYING'
+    
+    video_filename = schedule['videoIdentifier']
+    video_file_path = os.path.join(VIDEO_DIRECTORY, video_filename)
+    rtmp_url = f"{schedule['rtmpServer']}/{schedule['streamKey']}"
+    duration_minutes = schedule.get('durationMinutes')
+    command = FFMPEG_CMD_TIMED.format(video_file=video_file_path, rtmp_url=rtmp_url, duration=duration_minutes * 60) if duration_minutes else FFMPEG_CMD_INFINITE.format(video_file=video_file_path, rtmp_url=rtmp_url)
+    
+    logging.info(f"KHỞI ĐỘNG luồng ID={schedule_id}...")
+    try:
+        popen_kwargs = {
+            'shell': True, 'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE, 'universal_newlines': True
+        }
+        if os.name != 'nt':
+            popen_kwargs['preexec_fn'] = os.setsid
+        new_process = subprocess.Popen(command, **popen_kwargs)
 
+        def log_stderr_thread():
+            try:
+                for line in iter(new_process.stderr.readline, ''):
+                    if line: logging.error(f"[FFMPEG-ERROR ID={schedule_id}] {line.strip()}")
+            except ValueError: pass
+        
+        threading.Thread(target=log_stderr_thread, daemon=True).start()
+        running_streams[schedule_id] = new_process
+        socketio.sleep(1)
+
+        if not is_process_running(new_process):
+            logging.error(f"LỖI NGAY LẬP TỨC: Tiến trình ffmpeg cho ID={schedule_id} đã tắt.")
+            del running_streams[schedule_id]
+            return
+
+        schedule['status'] = 'LIVE'
+        logging.info(f"FFmpeg khởi động thành công cho ID={schedule_id} (PID: {new_process.pid})")
+        
+    except Exception as e:
+        logging.exception(f"LỖI NGHIÊM TRỌNG khi chạy Popen cho ID={schedule_id}: {e}")
+        schedule['status'] = 'FAILED'
+
+# ==============================================================================
+# HÀM GIÁM SÁT NỀN VÀ CÁC SỰ KIỆN WEBSOCKET
+# ==============================================================================
 def background_monitor():
-    """Tác vụ chạy nền để giám sát và cập nhật trạng thái."""
     logging.info("Bắt đầu luồng giám sát nền...")
     while True:
-        # Sao chép trạng thái để tránh block quá lâu
         with state_lock:
-            schedules_copy = list(schedules)
-        
-        # Xử lý logic bên ngoài lock
-        for schedule in schedules_copy:
-            manage_ffmpeg_stream(schedule)
-
-        # Khóa lại chỉ để cập nhật
-        with state_lock:
-            # Gửi trạng thái mới nhất cho tất cả các client
+            for schedule in schedules:
+                manage_ffmpeg_stream(schedule)
             socketio.emit('broadcast_update', schedules)
-
-        socketio.sleep(2) # Quan trọng: dùng socketio.sleep để tương thích với gevent
-
-# ==============================================================================
-# ĐỊNH NGHĨA CÁC SỰ KIỆN WEBSOCKET
-# ==============================================================================
+        socketio.sleep(2)
 
 @socketio.on('connect')
 def handle_connect():
-    """Khi một client kết nối, bắt đầu luồng nền nếu chưa có và gửi dữ liệu."""
     global background_thread
     with state_lock:
         if background_thread is None:
             background_thread = socketio.start_background_task(target=background_monitor)
-        # Gửi toàn bộ danh sách lịch trình cho client vừa kết nối
-        socketio.emit('broadcast_update', schedules, room=request.sid)
-    logging.info(f"Client {request.sid} đã kết nối.")
+        socketio.emit('broadcast_update', schedules)
 
+# [THAY ĐỔI] Sử dụng Acknowledgement để trả về kết quả
 @socketio.on('create_schedule')
 def handle_create_schedule(data):
-    logging.info(f"Nhận yêu cầu tạo lịch trình: {data['title']}")
+    video_filename = data.get('videoIdentifier')
+    video_file_path = os.path.join(VIDEO_DIRECTORY, video_filename)
+
+    # Bước 1: Xác thực thông tin
+    if not os.path.isfile(video_file_path):
+        logging.error(f"Xác thực thất bại: File '{video_filename}' không tồn tại.")
+        # Trả về lỗi cho client
+        return {'success': False, 'error': f"File video '{video_filename}' không tồn tại trong thư mục /videos."}
+
+    # Bước 2: Nếu thông tin hợp lệ, tạo lịch trình
     with state_lock:
         new_schedule = {
             "id": str(uuid.uuid4()), "title": data['title'], "videoIdentifier": data['videoIdentifier'],
@@ -195,32 +227,38 @@ def handle_create_schedule(data):
             "streamKey": data['streamKey'], "durationMinutes": data.get('durationMinutes'), "status": "PENDING"
         }
         schedules.append(new_schedule)
-    # Không cần emit ở đây, luồng nền sẽ tự động phát hiện và broadcast
+        logging.info(f"Đã tạo lịch trình ID={new_schedule['id']} sau khi xác thực thành công.")
     
+    # Trả về thành công cho client
+    return {'success': True, 'schedule': new_schedule}
+
+
 @socketio.on('stop_schedule')
 def handle_stop_schedule(data):
     schedule_id = data.get('id')
-    logging.info(f"Nhận yêu cầu dừng thủ công luồng ID={schedule_id}")
     with state_lock:
         schedule = next((s for s in schedules if s['id'] == schedule_id), None)
         if schedule:
-            schedule['status'] = 'STOPPING' # Trạng thái trung gian
+            schedule['status'] = 'STOPPING'
             if schedule_id in running_streams:
                 pid = running_streams[schedule_id].pid
-                terminate_process_async(pid)
-    # Luồng nền sẽ dọn dẹp và cập nhật trạng thái cuối cùng là COMPLETED
+                force_kill_process(pid)
+                del running_streams[schedule_id]
+            retry_start_times.pop(schedule_id, None)
+            schedule['status'] = 'COMPLETED'
+            socketio.emit('broadcast_update', schedules)
 
 @socketio.on('delete_schedule')
 def handle_delete_schedule(data):
     schedule_id = data.get('id')
-    logging.info(f"Nhận yêu cầu xóa luồng ID={schedule_id}")
     with state_lock:
         if schedule_id in running_streams:
             pid = running_streams[schedule_id].pid
-            terminate_process_async(pid)
+            force_kill_process(pid)
             del running_streams[schedule_id]
-        # Xóa lịch trình khỏi danh sách
+        retry_start_times.pop(schedule_id, None)
         schedules[:] = [s for s in schedules if s['id'] != schedule_id]
+        socketio.emit('broadcast_update', schedules)
 
 # ==============================================================================
 # ĐIỂM KHỞI CHẠY
@@ -228,3 +266,4 @@ def handle_delete_schedule(data):
 if __name__ == '__main__':
     logging.info("--- KHỞI ĐỘNG SERVER FLASK VỚI SOCKET.IO ---")
     socketio.run(app, host='0.0.0.0', port=5000)
+
