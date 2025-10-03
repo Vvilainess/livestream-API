@@ -38,14 +38,14 @@ RETRY_WINDOW_SECONDS = 180  # 3 phút
 # ==============================================================================
 # FFMPEG COMMANDS (ĐÃ TỐI ƯU HÓA)
 # ==============================================================================
-FFMPEG_BASE_OPTIONS = '' 
+FFMPEG_BASE_OPTIONS = "-loglevel error -hide_banner"
 FFMPEG_CMD_INFINITE = (
     f'ffmpeg -re -stream_loop -1 {FFMPEG_BASE_OPTIONS} '
     '-i "{video_file}" -c:v copy -c:a copy -f flv '
     '-nostdin "{rtmp_url}"'
 )
 FFMPEG_CMD_TIMED = (
-    f'ffmpeg -re {FFMPEG_BASE_OPTIONS} '
+    f'ffmpeg -re -stream_loop -1 {FFMPEG_BASE_OPTIONS} '
     '-i "{video_file}" -t {duration} '
     '-c:v copy -c:a copy -f flv '
     '-nostdin "{rtmp_url}"'
@@ -159,19 +159,19 @@ def manage_ffmpeg_stream(schedule):
     logging.info(f"KHỞI ĐỘNG luồng ID={schedule_id}...")
     try:
         popen_kwargs = {
-            'shell': True, 'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE, 'universal_newlines': True
+            'shell': True, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL, 'universal_newlines': True
         }
         if os.name != 'nt':
             popen_kwargs['preexec_fn'] = os.setsid
         new_process = subprocess.Popen(command, **popen_kwargs)
 
-        def log_stderr_thread():
-            try:
-                for line in iter(new_process.stderr.readline, ''):
-                    if line: logging.error(f"[FFMPEG-ERROR ID={schedule_id}] {line.strip()}")
-            except ValueError: pass
+        # def log_stderr_thread():
+            # try:
+                # for line in iter(new_process.stderr.readline, ''):
+                    # if line: logging.error(f"[FFMPEG-ERROR ID={schedule_id}] {line.strip()}")
+            # except ValueError: pass
         
-        threading.Thread(target=log_stderr_thread, daemon=True).start()
+        # threading.Thread(target=log_stderr_thread, daemon=True).start()
         running_streams[schedule_id] = new_process
         socketio.sleep(1)
 
@@ -266,4 +266,3 @@ def handle_delete_schedule(data):
 if __name__ == '__main__':
     logging.info("--- KHỞI ĐỘNG SERVER FLASK VỚI SOCKET.IO ---")
     socketio.run(app, host='0.0.0.0', port=5000)
-
